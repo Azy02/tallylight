@@ -61,6 +61,26 @@ find_tty() {
 }
 TTY=$(find_tty)
 
+# Walk up the same way to find the claude CLI process itself, so the overlay can tell a
+# session that DIED (process gone -> gray "stale" badge) from one that is merely quiet.
+# The hook's own parent is a transient shell wrapper, so $PPID alone is useless here.
+find_claude_pid() {
+  local pid=$$
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ -z "$pid" ] || [ "$pid" = "1" ] && break
+    # Match the executable name exactly — a loose grep on the full command line also matches
+    # transient shell wrappers whose args merely contain a ~/.claude/... path, and recording
+    # one of those (it exits immediately) would mark every session stale.
+    case "$(basename "$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ')" 2>/dev/null)" in
+      claude) echo "$pid"; return 0 ;;
+    esac
+  done
+  echo ""
+}
+CLAUDE_PID=$(find_claude_pid | tr -dc '0-9')
+
 LABEL=$(basename "$CWD" 2>/dev/null)
 [ -z "$LABEL" ] && LABEL="$SESSION_ID"
 
@@ -73,5 +93,6 @@ with open(path, 'w') as f:
         'tty': '$TTY',
         'label': '''$LABEL''',
         'updated': $UPDATED,
+        'pid': ${CLAUDE_PID:-0},
     }, f)
 "

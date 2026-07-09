@@ -22,6 +22,9 @@ function run(argv) {
   ObjC.bindFunction('CFArrayGetCount', ['long', ['void *']])
   ObjC.bindFunction('CFArrayGetValueAtIndex', ['void *', ['void *', 'long']])
   ObjC.bindFunction('CFRelease', ['void', ['void *']])
+  ObjC.bindFunction('kill', ['int', ['int', 'int']])   // kill(pid, 0): 0 = alive, -1 = gone —
+                                                        // powers the gray "stale" badge for
+                                                        // sessions whose claude process died
 
   var statusDir = $.NSHomeDirectory().js + "/.claude/status/"
   var overlays = {}          // session_id -> { window, layer, status }
@@ -113,7 +116,8 @@ function run(argv) {
     "working":     [0.95, 0.75, 0.15],
     "idle":        [0.20, 0.75, 0.35],
     "needs-input": [0.20, 0.55, 0.95],
-    "error":       [0.90, 0.25, 0.25]
+    "error":       [0.90, 0.25, 0.25],
+    "stale":       [0.58, 0.58, 0.58]
   }
 
   function colorFor(status) {
@@ -434,6 +438,12 @@ function run(argv) {
       if (data.updated && (now - data.updated) > STALE_SECONDS) continue
 
       var status = data.status || "idle"
+      // A session whose claude process is gone shows gray regardless of its last written
+      // status — "did this window silently die?" is a different question from "is it quiet?",
+      // and timestamp heuristics can't answer it (a single working turn can legitimately run
+      // an hour with no file update). pid is recorded by the hook since 2026-07-09; files
+      // without one just skip the check.
+      if (data.pid && data.pid > 0 && $.kill(data.pid, 0) !== 0) status = "stale"
       if (!rec) {
         rec = overlays[sessionId] = makeOverlayWindow(colorFor(status))
         rec.status = status

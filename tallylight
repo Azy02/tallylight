@@ -1,0 +1,157 @@
+#!/bin/bash
+# tallylight — per-window Claude Code status lights for macOS Terminal.app
+# https://github.com/Azy02/tallylight
+set -euo pipefail
+
+HOOKS_DIR="$HOME/.claude/hooks"
+STATUS_DIR="$HOME/.claude/status"
+SETTINGS="$HOME/.claude/settings.json"
+LABEL="com.tallylight.overlay"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+# Payload location: next to this script in a git clone, or ../share/tallylight when
+# installed by Homebrew (bin/tallylight + share/tallylight/{hooks,settings-snippet.json}).
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -d "$SELF_DIR/hooks" ]; then
+  PAYLOAD="$SELF_DIR"
+elif [ -d "$SELF_DIR/../share/tallylight/hooks" ]; then
+  PAYLOAD="$(cd "$SELF_DIR/../share/tallylight" && pwd)"
+else
+  PAYLOAD=""
+fi
+
+usage() {
+  cat <<'EOF'
+tallylight — per-window Claude Code status lights for macOS Terminal.app
+
+usage: tallylight <command>
+
+  install     copy hooks, load the overlay LaunchAgent, print the settings.json snippet
+  uninstall   unload the overlay and remove installed files
+  restart     reload the overlay (needed after editing corner-overlay.jxa)
+  doctor      check permissions, hooks, LaunchAgent, and status files
+EOF
+}
+
+cmd_install() {
+  [ -n "$PAYLOAD" ] || { echo "error: can't find the hooks/ payload next to this script"; exit 1; }
+  mkdir -p "$HOOKS_DIR" "$STATUS_DIR"
+  for f in corner-overlay.jxa status-indicator.sh status-cleanup.sh; do
+    cp "$PAYLOAD/hooks/$f" "$HOOKS_DIR/$f"
+    chmod +x "$HOOKS_DIR/$f" 2>/dev/null || true
+    echo "installed $HOOKS_DIR/$f"
+  done
+  cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/osascript</string>
+        <string>-l</string>
+        <string>JavaScript</string>
+        <string>$HOOKS_DIR/corner-overlay.jxa</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$HOOKS_DIR/tallylight.log</string>
+    <key>StandardErrorPath</key>
+    <string>$HOOKS_DIR/tallylight.err.log</string>
+</dict>
+</plist>
+PLIST
+  launchctl unload "$PLIST" 2>/dev/null || true
+  launchctl load "$PLIST"
+  echo "overlay loaded (starts automatically at login)"
+  echo
+  echo "One manual step: merge the hooks from"
+  echo "  $PAYLOAD/settings-snippet.json"
+  echo "into your ~/.claude/settings.json (don't overwrite the whole file), then run:"
+  echo "  tallylight doctor"
+}
+
+cmd_uninstall() {
+  launchctl unload "$PLIST" 2>/dev/null || true
+  rm -f "$PLIST"
+  for f in corner-overlay.jxa status-indicator.sh status-cleanup.sh tallylight.log tallylight.err.log; do
+    rm -f "$HOOKS_DIR/$f"
+  done
+  echo "overlay unloaded and files removed."
+  echo "Left in place for you to clean up yourself:"
+  echo "  - the tallylight hook entries in $SETTINGS"
+  echo "  - $STATUS_DIR (session status files)"
+}
+
+cmd_restart() {
+  launchctl unload "$PLIST" 2>/dev/null || true
+  launchctl load "$PLIST"
+  echo "overlay restarted"
+}
+
+ok()   { printf '  \033[32mok\033[0m   %s\n' "$1"; }
+bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAILS=$((FAILS+1)); }
+warn() { printf '  \033[33mwarn\033[0m %s\n' "$1"; }
+
+cmd_doctor() {
+  FAILS=0
+  echo "tallylight doctor"
+
+  if pgrep -f "corner-overlay.jxa" >/dev/null; then
+    ok "overlay process running (pid $(pgrep -f corner-overlay.jxa | head -1))"
+  else
+    bad "overlay process not running — try: tallylight restart"
+  fi
+
+  if launchctl list 2>/dev/null | grep -q "$LABEL"; then
+    ok "LaunchAgent $LABEL loaded"
+  elif [ -f "$PLIST" ]; then
+    bad "LaunchAgent present but not loaded — try: launchctl load $PLIST"
+  else
+    bad "LaunchAgent not installed — run: tallylight install"
+  fi
+
+  for f in corner-overlay.jxa status-indicator.sh status-cleanup.sh; do
+    if [ -f "$HOOKS_DIR/$f" ]; then ok "$HOOKS_DIR/$f present"; else bad "$HOOKS_DIR/$f missing — run: tallylight install"; fi
+  done
+
+  if [ -f "$SETTINGS" ] && grep -q "status-indicator.sh" "$SETTINGS"; then
+    ok "settings.json wires the status hooks"
+  else
+    bad "hooks not found in $SETTINGS — merge settings-snippet.json (see: tallylight install)"
+  fi
+
+  if [ -d "$STATUS_DIR" ]; then
+    FRESH=$(find "$STATUS_DIR" -name '*.json' -mmin -240 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$FRESH" -gt 0 ]; then
+      ok "status files: $FRESH updated in the last 4h (hooks are firing)"
+    else
+      warn "no recent status files — expected if no Claude Code session ran recently"
+    fi
+  else
+    bad "$STATUS_DIR missing — run: tallylight install"
+  fi
+
+  echo "  ...   checking Terminal automation permission (a macOS prompt may appear — allow it)"
+  if osascript -e 'tell application "Terminal" to count windows' >/dev/null 2>&1; then
+    ok "Automation permission granted (osascript -> Terminal)"
+  else
+    bad "Automation permission denied — System Settings > Privacy & Security > Automation > osascript > Terminal"
+  fi
+
+  echo
+  if [ "$FAILS" -eq 0 ]; then echo "all good."; else echo "$FAILS problem(s) found."; exit 1; fi
+}
+
+case "${1:-}" in
+  install)   cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  restart)   cmd_restart ;;
+  doctor)    cmd_doctor ;;
+  *)         usage; [ -n "${1:-}" ] && exit 1 ;;
+esac

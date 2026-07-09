@@ -1,70 +1,91 @@
 # tallylight
 
-A tally light is the little red lamp on a broadcast camera that tells everyone which camera is
-live. This is that, for [Claude Code](https://claude.com/claude-code) sessions in macOS
-Terminal.app: each window running a session gets a light in its titlebar.
+Per-window Claude Code status lights for macOS Terminal.app.
 
-![badge in a Terminal titlebar](docs/badge-context.png)
+When you run several [Claude Code](https://claude.com/claude-code) sessions side by side,
+tallylight shows which Terminal window is working, idle, waiting for your input, failed, or
+dead — without clicking through every window.
 
-| Badge | Status |
+![demo](docs/demo.gif)
+
+| Light | Status |
 |---|---|
 | ![working](docs/badge-working.png) | **working** — Claude is doing something |
 | ![idle](docs/badge-idle.png) | **idle** — finished, waiting for you |
 | ![needs input](docs/badge-needs-input.png) | **needs input** — permission prompt or a question |
 | ![error](docs/badge-error.png) | **error** — the turn failed |
+| ![stale](docs/badge-stale.png) | **stale** — the claude process is gone |
 
-Made for running several sessions side by side: you can see which window needs you without
-clicking through them.
+The name: a tally light is the little red lamp on a broadcast camera that tells everyone which
+camera is live. Same idea, for terminals.
 
-## How it works
+Works with: macOS Terminal.app, local Claude Code sessions, multiple windows and displays.
+Does not support: iTerm2, tmux, SSH/remote sessions (see [alternatives](#alternatives)).
 
-Terminal.app has no API for coloring its own tabs or titlebars (iTerm2 does — see
-[alternatives](#alternatives)). So this draws its own borderless little window on top of each
-Terminal window and keeps it in place.
-
-Two parts:
-
-- **Hooks** (`status-indicator.sh`, `status-cleanup.sh`): Claude Code runs these on prompt/stop/
-  notification events; they write one JSON status file per session under `~/.claude/status/`.
-- **Overlay** (`corner-overlay.jxa`): a background process, managed by launchd, that watches
-  those files and the Terminal windows and draws the badges. Starts at login, restarts if it
-  dies.
-
-The badge hides the moment you grab a titlebar and comes back a few frames after the window
-settles. Moves it can't see coming (Magnet and other keyboard window managers, menu tiling,
-scripts) are caught by a 30 Hz position check within a frame or two.
+No network access. No telemetry. Status files stay under `~/.claude/status/`.
 
 ## Install
 
 ```
-./install.sh
+git clone https://github.com/Azy02/tallylight
+cd tallylight
+./tallylight install
 ```
 
-Copies the scripts to `~/.claude/hooks/`, loads the LaunchAgent, and prints the hook config for
-you to merge into `~/.claude/settings.json` yourself.
+or with Homebrew:
+
+```
+brew install Azy02/tap/tallylight
+tallylight install
+```
+
+`install` copies the hooks, loads the overlay LaunchAgent, and prints the hook config to merge
+into your `~/.claude/settings.json`. Then:
+
+```
+tallylight doctor      # checks permissions, hooks, LaunchAgent, status files
+tallylight restart
+tallylight uninstall
+```
 
 On first run macOS asks: *"osascript wants to control Terminal"*. Allow it — that's how sessions
-get matched to windows. If you deny it, no badges ever appear.
+get matched to windows. Deny it and no lights ever appear.
 
-## Cost and caveats
+## How it works
 
-- **CPU**: ~13% of one core at idle, mostly the 30 Hz position check. On a 12-core machine
-  that's ~1% overall. `PULSE_INTERVAL` in `corner-overlay.jxa` is the knob if you'd rather have
-  cycles than responsiveness.
-- **Rare crash**: EXC_BAD_ACCESS in autorelease pool draining, roughly once in several hours.
-  launchd restarts the overlay within seconds; you might catch the badges blinking once.
-- Local Terminal.app sessions only. Nothing over SSH or inside tmux.
+Terminal.app has no API for coloring its own tabs or titlebars (iTerm2 does). So tallylight
+draws its own tiny borderless window on top of each Terminal window and keeps it in place.
+
+- **Hooks** (`status-indicator.sh`, `status-cleanup.sh`): Claude Code runs these on
+  prompt/stop/notification events; they write one JSON status file per session under
+  `~/.claude/status/`, including the claude process id.
+- **Overlay** (`corner-overlay.jxa`): a launchd-managed background process that watches those
+  files and the Terminal windows and draws the lights. Starts at login, restarts if it dies.
+
+The light hides the moment you grab a titlebar and comes back a few frames after the window
+settles. Moves it can't see coming — Magnet and other keyboard window managers, menu tiling,
+scripts — are caught by a 30 Hz position check within a frame or two. If a session's claude
+process dies, its light turns gray within a couple of seconds.
+
+## Where this fits
+
+| Tool type | What it solves | What tallylight solves |
+|---|---|---|
+| Claude statusline | info inside the current session | which window needs attention |
+| Notification hooks | a one-time alert | persistent visible state |
+| Usage dashboards | cost/token monitoring | per-window workflow state |
+| iTerm2 tab tools | iTerm2 users | Apple Terminal.app users |
 
 ## Alternatives
 
-If you use iTerm2, use its real API instead:
+iTerm2 users should use its real API instead:
 [JasperSui/claude-code-iterm2-tab-status](https://github.com/JasperSui/claude-code-iterm2-tab-status),
 [STRML/cc-iterm2-tab-alert](https://github.com/STRML/cc-iterm2-tab-alert).
 For tmux/remote sessions:
 [accessd/tmux-agent-indicator](https://github.com/accessd/tmux-agent-indicator),
 [samleeney/tmux-agent-status](https://github.com/samleeney/tmux-agent-status).
 
-This exists for people staying in Terminal.app anyway.
+tallylight is for people staying in Terminal.app anyway.
 
 ## License
 
