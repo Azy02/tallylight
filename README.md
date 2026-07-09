@@ -1,7 +1,8 @@
-# claude-terminal-indicator
+# tallylight
 
-Status lights for [Claude Code](https://claude.com/claude-code) sessions in macOS Terminal.app.
-Each Terminal window running a session gets a badge in its titlebar:
+A tally light is the little red lamp on a broadcast camera that tells everyone which camera is
+live. This is that, for [Claude Code](https://claude.com/claude-code) sessions in macOS
+Terminal.app: each window running a session gets a light in its titlebar.
 
 ![badge in a Terminal titlebar](docs/badge-context.png)
 

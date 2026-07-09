@@ -6,7 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOOKS_DEST="$HOME/.claude/hooks"
-PLIST_DEST="$HOME/Library/LaunchAgents/com.claude-terminal-indicator.overlay.plist"
+PLIST_DEST="$HOME/Library/LaunchAgents/com.tallylight.overlay.plist"
 
 echo "Installing to $HOOKS_DEST ..."
 mkdir -p "$HOOKS_DEST"
@@ -28,7 +28,7 @@ cat > "$PLIST_DEST" <<PLIST
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.claude-terminal-indicator.overlay</string>
+    <string>com.tallylight.overlay</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/osascript</string>
