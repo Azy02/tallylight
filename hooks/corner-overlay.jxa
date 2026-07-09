@@ -1,0 +1,792 @@
+ObjC.import('Cocoa')
+ObjC.import('Foundation')
+ObjC.import('CoreGraphics')
+
+function run(argv) {
+  var app = $.NSApplication.sharedApplication
+  app.setActivationPolicy($.NSApplicationActivationPolicyAccessory)
+
+  // Rebind the window-list pipeline to OPAQUE POINTERS (2026-07-09, eleventh addendum). By
+  // default the bridge wraps CGWindowListCopyWindowInfo's Copy-rule +1 return as an ObjC object
+  // whose ownership it manages badly: the reference is never released (the historical ~16-22KB/
+  // call leak, ~1GB per few hours) and manually CFRelease-ing the *object-bridged* value crashes
+  // at the next autorelease-pool drain (tried 2026-07-08, EXC_BAD_ACCESS within ~15s). Declared
+  // as `void *`, the bridge never wraps it and takes no ownership at all — the +1 is purely
+  // ours, and one CFRelease per call is exactly right. Verified standalone before deploying:
+  // output byte-identical to the object path, 2409 timer-driven calls (autorelease-pool drains
+  // between fires, the exact condition that crashed the object-bridged attempt) with zero
+  // crashes and ~0.8MB RSS drift, vs 53MB growth for the same call count without the release
+  // (opaque-cf-probe.jxa / opaque-endurance.jxa). These four are used only in
+  // getTerminalCGWindows(), so the process-global rebind changes nothing else.
+  ObjC.bindFunction('CGWindowListCopyWindowInfo', ['void *', ['unsigned int', 'unsigned int']])
+  ObjC.bindFunction('CFArrayGetCount', ['long', ['void *']])
+  ObjC.bindFunction('CFArrayGetValueAtIndex', ['void *', ['void *', 'long']])
+  ObjC.bindFunction('CFRelease', ['void', ['void *']])
+
+  var statusDir = $.NSHomeDirectory().js + "/.claude/status/"
+  var overlays = {}          // session_id -> { window, layer, status }
+  var sessionCache = {}      // session_id -> { windowID } — established by the slow (Apple Events)
+                              // tick, then used exclusively by the fast (WindowServer-only) tick so
+                              // position tracking never depends on Terminal's own event loop, which
+                              // stops processing Apple Events while a window drag is in progress.
+  var STALE_SECONDS = 24 * 3600
+  var RECT_WIDTH = 70
+  var RECT_HEIGHT = 20
+  var RECT_RADIUS = 6
+  var RIGHT_INSET = 10
+  var TITLEBAR_HEIGHT = 30   // estimate of Terminal's titlebar height, used only to vertically
+                              // center the indicator inside it rather than pin it to one edge
+  var GRAB_STRIP = 34        // depth of the press-hide test at the top of a window: the real
+                              // titlebar (~28px) plus a few px of margin. Was briefly 48 to
+                              // cover tab bars — wrong for this setup (one session per window,
+                              // no tab bar), where rows 30-48 are the first lines of terminal
+                              // TEXT: clicking them blinked the badge. The real cause of missed
+                              // drag grabs was never strip depth — it was testing the live
+                              // cursor position instead of the event's own location (see
+                              // onLeftDown). Badge placement still centers in TITLEBAR_HEIGHT.
+
+  // Two polling loops with sharply different jobs (fourteenth-addendum architecture):
+  //
+  // 1. The TICK (0.5s, constant): status colors, session discovery/sweep, geometry cache,
+  //    z-order re-assert, and the last-resort stillness reveal. It uses the FULL window list
+  //    (call 1.7ms + ~6ms of per-window bridge extraction over ~60 windows — measured,
+  //    targeted-query-probe.jxa) so it stays slow. It no longer speeds up during motion:
+  //    the adaptive 60Hz/15Hz fast mode existed to track/settle-detect motion, and the pulse
+  //    below does that job strictly better for every trigger.
+  //
+  // 2. The PULSE (30Hz, constant): motion detection ONLY, via one targeted single-window query
+  //    per tracked window (kCGWindowListOptionIncludingWindow; all four together measure
+  //    ~0.56ms + ~0.5ms extraction). Any bounds change -> hide that badge within ~1-2 frames
+  //    and start the settle chain for the reveal. This is the universal catcher the trigger-
+  //    sniffing approaches (hotkey monitors, modifier wind-up watchers) tried and failed to be:
+  //    Magnet consumes its own hotkeys, menus and scripts have no input signature at all — but
+  //    every one of them has to actually MOVE the window, and the pulse watches the window.
+  var TICK_INTERVAL = 0.5
+  // The rate knob balancing universal-catch latency against steady-state CPU. The in-app cost
+  // is dominated by per-fire timer dispatch (~1ms/fire — an empty timer in a bare process
+  // measures far cheaper; the NSApplication event-loop context is what's expensive), so CPU is
+  // nearly linear in rate: 30Hz measured ~13% of one core idle, 20Hz ~9%. Both were tried
+  // against real Magnet snaps: 20Hz measured a 149ms keydown-to-hidden (visibly laggy — the
+  // user's exact complaint, twice), 30Hz measured 97ms (~1-2 frames after the window actually
+  // starts moving, once Magnet's own ~50ms response is subtracted). Immediacy is the explicit
+  // requirement and ~13% of one core is ~0.6% of this machine — 30Hz is the right trade. Drop
+  // to 1/20 only if CPU ever matters more than the keyboard-snap artifact.
+  var PULSE_INTERVAL = 1 / 30
+  var lastBoundsById = {}    // windowID -> {x,y,width,height} seen on the previous tick
+  var pulsePrev = {}         // windowID -> bounds seen by the previous pulse
+
+  // A separately-timed overlay chasing a live drag always shows some lag, no matter how fast it
+  // polls — it's never actually part of the same redraw as the real window. Rather than keep
+  // trying to out-poll that (2026-07-09: tried 30Hz, then 60Hz, still visibly lagged), hide the
+  // badge for the duration of the drag instead and let it reappear once the window has genuinely
+  // settled. No lag is visible if there's nothing trying to visibly keep pace.
+  //
+  // "Settled" is decided by two signals together, not stillness alone (2026-07-09, second pass):
+  // real drags contain natural in-gesture pauses of 400-600ms, so any stillness threshold short
+  // enough to feel prompt after release is also short enough to fire mid-pause — the first
+  // version's badge popped back in during pauses, chased for a frame when motion resumed, then
+  // hid again. So the reveal also requires that the left button is actually UP
+  // (CGEventSourceButtonState, ~free): while it's held, a drag-hidden badge stays hidden no
+  // matter how long the window sits still. With the button carrying the mid-drag-pause job, the
+  // stillness window only has to cover whatever the settle chain's cap handed off — in the
+  // current architecture the chain (25ms sample pairs) handles essentially every reveal, and
+  // this stillness rule is the last-resort fallback evaluated on the 0.5s tick. Was 300ms;
+  // lowered 2026-07-09 (tenth addendum) after real-drag feedback that the reveal felt laggy.
+  var REVEAL_DELAY_MS = 100
+  var lastMotionTimeById = {}   // windowID -> ms timestamp this window was last seen moving
+
+  function setOverlayVisible(rec, windowID, visible) {
+    if (visible) {
+      // Assert on every visible call (a one-shot order-in latched the badge invisible when a
+      // single call failed silently — ninth addendum). Since the badge lives at window level 1
+      // (see makeOverlayWindow), plain order-front suffices: no relative ordering against the
+      // terminal window is needed or wanted anymore, and raises below cannot cover it.
+      rec.window.orderFrontRegardless
+      rec.hidden = false
+    } else if (rec.hidden !== true) {
+      rec.window.orderOut($())
+      rec.hidden = true
+    }
+  }
+
+  var COLORS = {
+    "working":     [0.95, 0.75, 0.15],
+    "idle":        [0.20, 0.75, 0.35],
+    "needs-input": [0.20, 0.55, 0.95],
+    "error":       [0.90, 0.25, 0.25]
+  }
+
+  function colorFor(status) {
+    var c = COLORS[status] || [0.6, 0.6, 0.6]
+    return $.NSColor.colorWithSRGBRedGreenBlueAlpha(c[0], c[1], c[2], 1.0)
+  }
+
+  function listJSONFiles() {
+    var fm = $.NSFileManager.defaultManager
+    var files = fm.contentsOfDirectoryAtPathError(statusDir, $())
+    var result = []
+    if (files) {
+      var count = files.count
+      for (var i = 0; i < count; i++) {
+        var name = files.objectAtIndex(i).js
+        if (name && name.slice(-5) === ".json") result.push(name)
+      }
+    }
+    return result
+  }
+
+  function readJSON(path) {
+    try {
+      var nsstr = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, $())
+      if (!nsstr) return null
+      var s = nsstr.js
+      if (!s) return null
+      return JSON.parse(s)
+    } catch (e) {
+      return null
+    }
+  }
+
+  // Status files only actually change when a hook fires (a handful of times per turn at most),
+  // not every tick — re-reading and JSON.parse-ing them 60 times a second while nothing has
+  // changed is pure waste. A cheap mtime check (stat, not a full read) skips that work when the
+  // file hasn't moved since last time.
+  var statusCache = {}   // fname -> { mtime, data }
+  function readJSONCached(path, fname) {
+    var fm = $.NSFileManager.defaultManager
+    var attrs = fm.attributesOfItemAtPathError(path, $())
+    if (!attrs) return null
+    var mtimeDate = attrs.objectForKey($.NSFileModificationDate)
+    var mtime = mtimeDate ? ObjC.unwrap(mtimeDate.timeIntervalSince1970) : 0
+    var cached = statusCache[fname]
+    if (cached && cached.mtime === mtime) return cached.data
+    var data = readJSON(path)
+    statusCache[fname] = { mtime: mtime, data: data }
+    return data
+  }
+
+  // --- Apple Events (Terminal's own event loop; can stall during window drags) ---
+  function getTtyWindowMap() {
+    var map = {}
+    try {
+      var Terminal = Application("Terminal")
+      var windows = Terminal.windows()
+      for (var i = 0; i < windows.length; i++) {
+        try {
+          var win = windows[i]
+          var bounds = win.bounds()
+          var tabs = win.tabs()
+          for (var j = 0; j < tabs.length; j++) {
+            var tty = tabs[j].tty()
+            if (tty) map[tty] = bounds
+          }
+        } catch (e) {}
+      }
+    } catch (e) {}
+    return map
+  }
+
+  // --- WindowServer directly (drag-proof, doesn't touch Terminal's own event loop at all) ---
+  // The returned CFArray is a Copy-rule +1 that WE own, because the function is rebound at
+  // startup to return an opaque `void *` the bridge takes no ownership of — see the
+  // ObjC.bindFunction block at the top of run() for the full story. The one CFRelease below is
+  // therefore correct and required; it is NOT the object-bridged CFRelease that crashed on
+  // 2026-07-08 (that variant released a value the bridge had also entangled with its autorelease
+  // handling — still do not do that). If an exception ever fires mid-loop the release is skipped
+  // and that one array (~16-22KB) leaks — bounded, and strictly better than the historical
+  // every-call leak. The per-item castRefToObject/objectForKey path is unchanged: those are +0
+  // interior references owned by the array, exactly as before.
+  var myPid = ObjC.unwrap($.NSProcessInfo.processInfo.processIdentifier)
+  var lastFullScan = []   // front-to-back layer-0 windows from the latest full scan:
+                          // { termId (null unless a Terminal window), x, y, width, height }
+                          // — consumed by the tick's occlusion emulation (see fastTick)
+  function getTerminalCGWindows() {
+    var result = []
+    var scan = []
+    try {
+      var info = $.CGWindowListCopyWindowInfo(1, 0)   // kCGWindowListOptionOnScreenOnly, kCGNullWindowID
+      var count = $.CFArrayGetCount(info)
+      for (var i = 0; i < count; i++) {
+        var dict = ObjC.castRefToObject($.CFArrayGetValueAtIndex(info, i))
+        if (ObjC.unwrap(dict.objectForKey("kCGWindowLayer")) !== 0) continue   // normal level only
+        if (ObjC.unwrap(dict.objectForKey("kCGWindowOwnerPID")) === myPid) continue   // not our badges
+        var boundsDict = dict.objectForKey("kCGWindowBounds")
+        if (!boundsDict) continue
+        var owner = dict.objectForKey("kCGWindowOwnerName")
+        var isTerminal = owner && owner.js === "Terminal"
+        var entry = {
+          termId: null,
+          x: ObjC.unwrap(boundsDict.objectForKey("X")),
+          y: ObjC.unwrap(boundsDict.objectForKey("Y")),
+          width: ObjC.unwrap(boundsDict.objectForKey("Width")),
+          height: ObjC.unwrap(boundsDict.objectForKey("Height"))
+        }
+        if (isTerminal) {
+          var num = dict.objectForKey("kCGWindowNumber")
+          if (num) {
+            entry.termId = ObjC.unwrap(num)
+            result.push({ id: entry.termId, x: entry.x, y: entry.y, width: entry.width, height: entry.height })
+          }
+        }
+        scan.push(entry)
+      }
+      $.CFRelease(info)
+      lastFullScan = scan
+    } catch (e) {}
+    return result
+  }
+
+  // Recompute occlusion for every badge from a FRESH scan and apply the hide side immediately.
+  // Un-occlusion only clears the flag: the reveal rides the normal paths (watchdog -> settle
+  // chain, gated on button/chord), which also prevents flicker while an occluder is dragged
+  // ACROSS a badge — the badge hides at once and reappears only when the gesture ends.
+  function refreshOcclusion() {
+    var terms = getTerminalCGWindows()   // refreshes lastFullScan too
+    var byId = {}
+    for (var i = 0; i < terms.length; i++) byId[terms[i].id] = terms[i]
+    for (var sid in overlays) {
+      var rec = overlays[sid]
+      var c = sessionCache[sid]
+      if (!rec || !c) continue
+      var cg = byId[c.windowID]
+      if (!cg) continue
+      var occ = badgeOccluded(c.windowID, cg)
+      if (occ && rec.occluded !== true) {
+        rec.occluded = true
+        setOverlayVisible(rec, null, false)
+      } else if (!occ && rec.occluded === true) {
+        rec.occluded = false
+      }
+    }
+  }
+
+  // Occlusion watch: the tick's 0.5s occlusion granularity is fine at rest but visibly slow
+  // while the user is actively dragging some OTHER window over a badge corner ("hide
+  // immediately, just like the drag" — nineteenth addendum). Occlusion only changes when
+  // something moves, and interactive movers hold a gesture — so this 60Hz watch runs ONLY
+  // while the left button or the ctrl+opt chord is down (+300ms grace), costing ~20% of a core
+  // for the gesture's duration and nothing at idle (measured 81ms coverage-to-hide at 25Hz;
+  // 60Hz brings it in line with the ~30-45ms drag-hide feel). Armed by any press on a tracked
+  // titlebar, any press OUTSIDE tracked windows (foreign window about to be dragged), and any
+  // chord-down.
+  var occWatchTimer = null
+  function startOcclusionWatch() {
+    if (occWatchTimer) return
+    var graceUntil = 0
+    occWatchTimer = $.NSTimer.scheduledTimerWithTimeIntervalRepeatsBlock(1 / 60, true, function(t) {
+      var held = !!$.CGEventSourceButtonState(0, 0) || chordLive()
+      var now = Date.now()
+      if (held) graceUntil = now + 300
+      else if (now > graceUntil) {
+        occWatchTimer.invalidate
+        occWatchTimer = null
+        return
+      }
+      refreshOcclusion()
+    })
+  }
+
+  // Occlusion emulation for the level-1 badge: true if any foreign level-0 window IN FRONT of
+  // this terminal window overlaps the badge rect. Uses lastFullScan (front-to-back), refreshed
+  // by every getTerminalCGWindows() call.
+  function badgeOccluded(termId, cg) {
+    var bx = cg.x + cg.width - RECT_WIDTH - RIGHT_INSET
+    var by = cg.y + (TITLEBAR_HEIGHT - RECT_HEIGHT) / 2
+    for (var i = 0; i < lastFullScan.length; i++) {
+      var w = lastFullScan[i]
+      if (w.termId === termId) return false   // reached the badge's own window: nothing above overlapped
+      if (w.x < bx + RECT_WIDTH && w.x + w.width > bx && w.y < by + RECT_HEIGHT && w.y + w.height > by) {
+        return true
+      }
+    }
+    return false
+  }
+
+  function findWindowID(cgWindows, bounds) {
+    var TOL = 3
+    for (var i = 0; i < cgWindows.length; i++) {
+      var w = cgWindows[i]
+      if (Math.abs(w.x - bounds.x) <= TOL && Math.abs(w.y - bounds.y) <= TOL &&
+          Math.abs(w.width - bounds.width) <= TOL && Math.abs(w.height - bounds.height) <= TOL) {
+        return w.id
+      }
+    }
+    return null
+  }
+
+  function makeOverlayWindow(color) {
+    var rect = $.NSMakeRect(0, 0, RECT_WIDTH, RECT_HEIGHT)
+    var win = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer(rect, 0, $.NSBackingStoreBuffered, false)
+    win.setOpaque(false)
+    win.setBackgroundColor($.NSColor.clearColor)
+    win.setHasShadow(false)
+    win.setIgnoresMouseEvents(true)
+    win.collectionBehavior = $.NSWindowCollectionBehaviorCanJoinAllSpaces | $.NSWindowCollectionBehaviorStationary | $.NSWindowCollectionBehaviorIgnoresCycle
+    // 2026-07-09: a crash was caught with -[_NSWindowTransformAnimation dealloc] in its stack,
+    // implicating implicit window-transform-animation objects created on frame changes. This
+    // window is repositioned by a timer, not by anything that should ever animate — explicitly
+    // opting out removes a plausible source of that specific crash without touching tick rate.
+    win.animationBehavior = $.NSWindowAnimationBehaviorNone
+    // Level 1: one above NSNormalWindowLevel, below floating panels/menus. A click-raise keeps
+    // the terminal at level 0, so it can NEVER rise above its own badge — this is what finally
+    // killed the intermittent content-click blink structurally (eighteenth addendum) after two
+    // rounds of re-assert guards lost timing races against the raise. The cost — the badge
+    // would also sit above OTHER apps' normal windows overlapping the terminal's corner — is
+    // repaid in software: the tick hides any badge whose rect is overlapped by a foreign
+    // level-0 window in front of its terminal (occlusion emulation, ~0.5s granularity).
+    win.level = 1
+
+    var view = $.NSView.alloc.initWithFrame(rect)
+    view.setWantsLayer(true)
+    var layer = view.layer
+    layer.backgroundColor = color.CGColor
+    layer.cornerRadius = RECT_RADIUS
+    win.contentView = view
+
+    return { window: win, layer: layer }
+  }
+
+  function positionOverlay(rec, cg, screenHeight) {
+    var x = cg.x + cg.width - RECT_WIDTH - RIGHT_INSET
+    // Vertically centered inside the titlebar strip, not pinned to its top/bottom edge.
+    var y = screenHeight - cg.y - (TITLEBAR_HEIGHT + RECT_HEIGHT) / 2
+    rec.window.setFrameDisplay($.NSMakeRect(x, y, RECT_WIDTH, RECT_HEIGHT), true)
+  }
+
+  // The tick: constant 0.5s, full window list. Owns status colors, overlay creation/sweep,
+  // geometry caching, per-tick z-order re-assert, and the last-resort stillness reveal. Motion
+  // detection is the PULSE's job now (see pulseTick), so this never changes rate.
+  function fastTick() {
+    var nowMs = Date.now()
+    var files = listJSONFiles()
+    var fileSet = {}
+    for (var i = 0; i < files.length; i++) fileSet[files[i].slice(0, -5)] = true
+
+    var cgWindows = getTerminalCGWindows()
+    var cgById = {}
+    for (var i = 0; i < cgWindows.length; i++) cgById[cgWindows[i].id] = cgWindows[i]
+    var screenHeight = $.NSScreen.mainScreen.frame.size.height
+    var now = Math.floor(nowMs / 1000)
+    // One global button poll per tick, shared by every window below.
+    // kCGEventSourceStateCombinedSessionState = 0, kCGMouseButtonLeft = 0 (both verified against
+    // the bridge's own constants). Reads the window server's shared event-state memory — measured
+    // ~0.007ms/call vs ~0.05ms for NSEvent.pressedMouseButtons (op-cost-probe.jxa, 2026-07-09).
+    var leftButtonDown = !!$.CGEventSourceButtonState(0, 0)
+
+    for (var i = 0; i < files.length; i++) {
+      var fname = files[i]
+      var sessionId = fname.slice(0, -5)
+      var cached = sessionCache[sessionId]
+      if (!cached) continue // not yet discovered — slow tick will pick it up
+
+      var cg = cgById[cached.windowID]
+      if (!cg) {
+        // Window left the on-screen list: closed, minimized, or on a Space that was switched
+        // away from. Hide its badge too — the badge joins all Spaces, so leaving it ordered in
+        // meant it kept floating at its old spot over unrelated content until the session ended.
+        // slowTick re-maps the window if/when it comes back on screen.
+        if (overlays[sessionId]) setOverlayVisible(overlays[sessionId], null, false)
+        delete sessionCache[sessionId]
+        delete lastBoundsById[cached.windowID]
+        delete lastMotionTimeById[cached.windowID]
+        delete pulsePrev[cached.windowID]
+        continue
+      }
+
+      var prevBounds = lastBoundsById[cached.windowID]
+      var moved = !prevBounds || prevBounds.x !== cg.x || prevBounds.y !== cg.y ||
+                  prevBounds.width !== cg.width || prevBounds.height !== cg.height
+      lastBoundsById[cached.windowID] = { x: cg.x, y: cg.y, width: cg.width, height: cg.height }
+
+      if (moved) lastMotionTimeById[cached.windowID] = nowMs
+      var rec = overlays[sessionId]
+      var stillSettling = (nowMs - (lastMotionTimeById[cached.windowID] || 0)) < REVEAL_DELAY_MS
+      // Reveal needs stillness AND (for an already-hidden badge) no held gesture — neither the
+      // mouse button (mid-drag pauses) nor the ctrl+opt chord (between chained snaps). The
+      // gesture terms apply only to hidden badges: a visible badge must never hide just because
+      // a button or chord is down somewhere. This tick-level reveal is the FALLBACK — the settle
+      // chain normally reveals long before it; this catches whatever the chain's cap handed off.
+      var occluded = badgeOccluded(cached.windowID, cg)
+      if (rec) rec.occluded = occluded   // reveal paths (chain, watchdog) must respect this —
+                                          // without it they fight the occlusion hide and the
+                                          // badge oscillates (measured: occ=true every tick yet
+                                          // the badge stayed up, chain-revived each time)
+      var shouldShow = !stillSettling && !((leftButtonDown || chordWasHeld) && rec && rec.hidden) &&
+                       !occluded
+
+      if (rec) {
+        if (shouldShow) {
+          // Reposition only on change (position while still hidden, THEN order in, so the badge
+          // always appears already at its final spot); re-assert z-order every tick regardless
+          // — see setOverlayVisible for why that is not optional.
+          if (moved || rec.hidden !== false) positionOverlay(rec, cg, screenHeight)
+          setOverlayVisible(rec, cached.windowID, true)
+        } else {
+          // Hide WITHOUT repositioning. Repositioning first painted one visible catch-up frame
+          // at the start of every drag — the "tries to track for a few frames" artifact. A
+          // hiding badge never needs to move; it's positioned again on reveal.
+          setOverlayVisible(rec, cached.windowID, false)
+        }
+      }
+
+      var data = readJSONCached(statusDir + fname, fname)
+      if (!data) continue
+      if (data.updated && (now - data.updated) > STALE_SECONDS) continue
+
+      var status = data.status || "idle"
+      if (!rec) {
+        rec = overlays[sessionId] = makeOverlayWindow(colorFor(status))
+        rec.status = status
+        rec.hidden = null   // unset, so the first visibility call below always actually applies
+        rec.occluded = occluded
+        if (shouldShow) {
+          positionOverlay(rec, cg, screenHeight)
+          setOverlayVisible(rec, cached.windowID, true)
+        } else {
+          setOverlayVisible(rec, cached.windowID, false)
+        }
+      } else if (rec.status !== status) {
+        rec.layer.backgroundColor = colorFor(status).CGColor
+        rec.status = status
+      }
+    }
+
+    for (var sid in overlays) {
+      if (!fileSet[sid]) {
+        var closedWindowID = sessionCache[sid] ? sessionCache[sid].windowID : null
+        overlays[sid].window.orderOut($())
+        overlays[sid].window.close
+        delete overlays[sid]
+        delete sessionCache[sid]
+        delete statusCache[sid + ".json"]
+        if (closedWindowID !== null) {
+          delete lastMotionTimeById[closedWindowID]
+          delete pulsePrev[closedWindowID]
+        }
+      }
+    }
+  }
+
+  // Drag sensing is EVENT-DRIVEN (2026-07-09, twelfth addendum): global mouse monitors deliver
+  // the press/release themselves, so there is no polling granularity between the user's action
+  // and ours — the previous 20Hz poll left the badge visible for up to ~50ms into a fast drag
+  // ("sometimes I still see it"), which no poll rate truly fixes. Monitors also cost nothing at
+  // idle: the handler only runs when a left-click actually happens. (An earlier probe concluded
+  // global monitors don't fire under osascript — that probe pumped a bare NSRunLoop; they ride
+  // NSApplication's event stream and work fine under this script's app.run. monitor-probe2.jxa:
+  // 199 moves + 2 real clicks delivered.)
+  //
+  // Press inside a tracked titlebar -> hide that window's badge at event-delivery time, before
+  // the window has visibly moved at all. A titlebar click that never becomes a drag costs a
+  // badge blink of roughly the click's own duration (the release handler below restores it).
+  function onLeftDown(evt) {
+    // Use the EVENT's own location, never the live cursor: by the time a fast drag's press
+    // reaches this handler, the cursor has already flown — measured 360px away from the press
+    // point in the discriminating probe (event-location-probe.jxa) — which misclassified
+    // titlebar grabs as content clicks (or missed the window entirely) precisely on fast drags.
+    // For a windowless global-monitor event, locationInWindow is in screen coordinates.
+    var loc = evt.locationInWindow
+    var cgY = $.NSScreen.mainScreen.frame.size.height - loc.y   // same y-flip as positionOverlay
+    var pressedTracked = false
+    for (var wid in lastBoundsById) {
+      var b = lastBoundsById[wid]
+      var inWindow = loc.x >= b.x && loc.x <= b.x + b.width && cgY >= b.y && cgY <= b.y + b.height
+      if (!inWindow) continue
+      pressedTracked = true
+      var widNum = Number(wid)   // for-in keys are strings; sessionCache stores numbers
+      if (cgY <= b.y + GRAB_STRIP) {
+        // Titlebar press: a drag is likely starting — hide before any motion exists.
+        lastMotionTimeById[wid] = Date.now()
+        for (var sid in overlays) {
+          if (sessionCache[sid] && sessionCache[sid].windowID === widNum) {
+            setOverlayVisible(overlays[sid], null, false)
+          }
+        }
+        startDragWatch(widNum)   // release may be consumed by the drag; watch for it (and
+                                   // for motion, as backup to this predictive hide)
+        startOcclusionWatch()      // this drag may carry the window over a SIBLING's badge
+      } else {
+        // Content press: the raise can no longer cover the badge (level 1), so nothing to
+        // guard. Refresh occlusion soon after the raise (the click may have just LIFTED this
+        // window above a foreign occluder, in which case its badge should reappear promptly
+        // rather than on the next 0.5s tick), and arm the drag watcher defensively in case
+        // this press somehow turns into motion.
+        $.NSTimer.scheduledTimerWithTimeIntervalRepeatsBlock(0.12, false, function(t) { fastTick() })
+        $.NSTimer.scheduledTimerWithTimeIntervalRepeatsBlock(0.4, false, function(t) { fastTick() })
+        startDragWatch(widNum)
+      }
+      break
+    }
+    // Press outside every tracked window: possibly grabbing a FOREIGN window that is about to
+    // be dragged over a badge corner — watch occlusion for the gesture's duration.
+    if (!pressedTracked) startOcclusionWatch()
+  }
+
+
+
+  // Release -> reveal after a settle CHAIN: sample fresh window bounds every SETTLE_CHECK_MS
+  // and reveal each hidden badge the first time two consecutive samples agree. One pair is not
+  // enough: measured on a real HID-stream drag (micro-drag-poster.jxa), the window's final
+  // position commits a few ms AFTER mouse-up, so a single now-vs-35ms pair straddles that
+  // commit, mismatches, and a fall-back-to-stillness penalty turned a ~50ms reveal into ~163ms.
+  // Chaining means: ordinary drag-end commit -> reveal on the second pair (~70-105ms); plain
+  // release with no shift -> first pair (~50ms); a genuine edge-snap animation -> tracked to
+  // its end and revealed one pair after it parks, which beats the stillness path there too.
+  // Capped at SETTLE_MAX_CHECKS (then the normal stillness path owns it), aborted if the button
+  // goes down again mid-chain (the new drag's own release restarts it). Cost: one window-list
+  // read per check, only ever after a release while something is hidden.
+  // Targeted single-window bounds query (kCGWindowListOptionIncludingWindow = 8): measured
+  // ~0.14ms per call vs 1.7ms for the full list plus ~6ms of 60-window extraction — this is
+  // what makes the pulse and the settle chain affordable at high frequency. Returns null when
+  // the window is not on screen. Same opaque/CFRelease discipline as getTerminalCGWindows.
+  function queryWindowBounds(wid) {
+    var cur = null
+    try {
+      var info = $.CGWindowListCopyWindowInfo(8, wid)
+      if ($.CFArrayGetCount(info) > 0) {
+        var b = ObjC.castRefToObject($.CFArrayGetValueAtIndex(info, 0)).objectForKey("kCGWindowBounds")
+        cur = { x: ObjC.unwrap(b.objectForKey("X")), y: ObjC.unwrap(b.objectForKey("Y")),
+                width: ObjC.unwrap(b.objectForKey("Width")), height: ObjC.unwrap(b.objectForKey("Height")) }
+      }
+      $.CFRelease(info)
+    } catch (e) {}
+    return cur
+  }
+
+  var SETTLE_CHECK_MS = 25   // was 35; tightened after measuring the drag-end-commit straddle
+                              // case (mismatch on the first pair costs one extra interval)
+  var SETTLE_MAX_CHECKS = 40  // ~1s cap: tracks even a slow snap/tiling animation to its end at
+                              // ~0.5ms/check; mouse drags and Magnet snaps resolve in 1-3 checks.
+                              // Past the cap the tick-level stillness fallback owns the reveal.
+  var settleChainActive = false
+  function runSettleChain() {
+    if (settleChainActive) return
+    var hiddenWids = {}
+    var any = false
+    for (var sid in overlays) {
+      if (overlays[sid].hidden === true && sessionCache[sid]) { hiddenWids[sessionCache[sid].windowID] = true; any = true }
+    }
+    if (!any) return
+    settleChainActive = true
+    var prevById = {}
+    for (var wid in hiddenWids) prevById[wid] = queryWindowBounds(Number(wid))
+    var checks = 0
+    function settleCheck() {
+      $.NSTimer.scheduledTimerWithTimeIntervalRepeatsBlock(SETTLE_CHECK_MS / 1000, false, function(t) {
+        if ($.CGEventSourceButtonState(0, 0) || chordLive()) { settleChainActive = false; return }
+        // ^ button re-grabbed or chord (re-)held: stay hidden; the release edge restarts the chain
+        var screenHeight = $.NSScreen.mainScreen.frame.size.height
+        var pending = []
+        for (var sid in overlays) {
+          var rec = overlays[sid]
+          var c = sessionCache[sid]
+          if (!rec || rec.hidden !== true || rec.occluded === true || !c) continue
+          var a = prevById[c.windowID]
+          var b = queryWindowBounds(c.windowID)
+          prevById[c.windowID] = b
+          if (!a || !b) continue
+          if (a.x !== b.x || a.y !== b.y || a.width !== b.width || a.height !== b.height) {
+            pending.push(c.windowID)
+            continue
+          }
+          // Parked. Sync the tick bookkeeping so the next fastTick agrees (else it would see
+          // "moved" vs stale bounds / a fresh motion stamp and immediately re-hide the badge).
+          lastBoundsById[c.windowID] = { x: b.x, y: b.y, width: b.width, height: b.height }
+          pulsePrev[c.windowID] = { x: b.x, y: b.y, width: b.width, height: b.height }
+          delete lastMotionTimeById[c.windowID]
+          positionOverlay(rec, b, screenHeight)
+          setOverlayVisible(rec, c.windowID, true)
+        }
+        checks++
+        if (pending.length === 0) { settleChainActive = false; return }
+        if (checks < SETTLE_MAX_CHECKS) {
+          settleCheck()
+        } else {
+          // Still moving after the cap: hand off to the tick-level stillness path with a fresh
+          // stamp so it reveals REVEAL_DELAY_MS after the motion truly ends.
+          var nowMs = Date.now()
+          for (var p = 0; p < pending.length; p++) lastMotionTimeById[pending[p]] = nowMs
+          settleChainActive = false
+        }
+      })
+    }
+    settleCheck()
+  }
+
+  // The universal motion pulse: the trigger-agnostic catcher for EVERY way a window can move —
+  // Magnet (whatever it's bound to), its menu-bar menu, macOS native tiling, AppleScript, other
+  // tools, anything. Trigger-sniffing was tried twice and lost twice (Magnet's event tap
+  // consumes its hotkeys; a modifier-wind-up watcher proved unreliable in real use) — but every
+  // one of these movers must actually MOVE the window, so the pulse just watches the tracked
+  // windows themselves at 30Hz via the cheap targeted query. On any bounds change: hide within
+  // ~1-2 frames and let the settle chain reveal. The mouse paths above remain as accelerators
+  // (a titlebar press still hides BEFORE motion; release still reveals faster than stillness).
+  //
+  // PREDICTIVE chord hide, rode into the pulse (fifteenth addendum): detection-after-motion can
+  // never fully erase the artifact for a window manager that TELEPORTS the window — the badge
+  // always outlives the departure by the detection latency, and the user reliably saw that
+  // ~50-100ms orphan for Magnet snaps. But a Magnet op requires ctrl+opt to be physically HELD
+  // first, and CGEventSourceFlagsState(0) reads that live for ~0.006ms (verified: reflects
+  // synthetic presses; robust to device-bit noise) — no events to consume, no monitor to trust.
+  // So each pulse also checks the chord: on ctrl+opt becoming held with Terminal frontmost, the
+  // frontmost Terminal window's badge hides BEFORE any key lands (the wind-up is human-slow,
+  // 50-300ms); it stays hidden while the chord is held (chained snaps stay clean), and the
+  // release edge fires the settle chain. A chord that never moves anything blinks the badge for
+  // roughly the chord's own duration — same accepted trade as the titlebar-click blink.
+  function chordLive() {
+    var f = Number($.CGEventSourceFlagsState(0))
+    return (f & 0x40000) !== 0 && (f & 0x80000) !== 0   // control | option
+  }
+  var chordWasHeld = false
+  function onChordDown() {
+    startOcclusionWatch()   // a foreign window may be about to snap over a badge corner
+    var front = $.NSWorkspace.sharedWorkspace.frontmostApplication
+    if (!front || front.bundleIdentifier.js !== "com.apple.Terminal") return
+    var wins = getTerminalCGWindows()   // front-to-back: [0] is the window Magnet will act on
+    if (!wins.length) return
+    var topId = wins[0].id
+    lastMotionTimeById[topId] = Date.now()
+    for (var sid in overlays) {
+      if (sessionCache[sid] && sessionCache[sid].windowID === topId) {
+        setOverlayVisible(overlays[sid], null, false)
+      }
+    }
+  }
+
+  function pulseTick() {
+    var chordHeld = chordLive()
+    if (chordHeld && !chordWasHeld) onChordDown()
+    chordWasHeld = chordHeld
+
+    var seen = {}
+    for (var sid in sessionCache) {
+      var wid = sessionCache[sid].windowID
+      if (seen[wid]) continue
+      seen[wid] = true
+      var cur = queryWindowBounds(wid)
+      if (!cur) continue                 // off-screen: the tick's !cg branch owns that case
+      var prev = pulsePrev[wid]
+      pulsePrev[wid] = cur
+      if (!prev) continue
+      if (prev.x !== cur.x || prev.y !== cur.y || prev.width !== cur.width || prev.height !== cur.height) {
+        lastMotionTimeById[wid] = Date.now()
+        for (var s2 in overlays) {
+          if (sessionCache[s2] && sessionCache[s2].windowID === wid && overlays[s2].hidden !== true) {
+            setOverlayVisible(overlays[s2], null, false)
+          }
+        }
+        runSettleChain()
+      }
+    }
+
+    // The reveal watchdog — one standing rule instead of edge-triggered reveals: if anything is
+    // hidden while no gesture is held and no chain is running, run the chain. This is what
+    // guarantees a hidden badge can never be stranded: an aborted chain (e.g. its first check
+    // raced a not-yet-cleared synthetic modifier flag — measured as a 205ms reveal before this
+    // existed), a chain-cap handoff, a missed release event — all heal within one pulse tick.
+    // The event paths (mouse release, drag watcher) remain as faster starters; this is the floor.
+    if (!chordHeld && !$.CGEventSourceButtonState(0, 0) && !settleChainActive) {
+      for (var s3 in overlays) {
+        if (overlays[s3].hidden === true && overlays[s3].occluded !== true && sessionCache[s3]) {
+          runSettleChain()
+          break
+        }
+      }
+    }
+  }
+
+  // The mouse-up that ENDS a window drag is consumed by the drag machinery and never reaches
+  // global monitors (plain clicks' ups do arrive — probe2 counted them — but post-drag reveals
+  // measured exactly like the old stillness fallback, meaning onLeftUp never fired for drags).
+  // So the drag itself carries its own release detector: armed by the titlebar press, a 60Hz
+  // watcher polls just the button state (~0.007ms/read) and fires the settle chain the moment
+  // the button reads up. It exists only between grab and reveal — zero cost at idle.
+  var dragWatchTimer = null
+  function startDragWatch(widNum) {
+    if (dragWatchTimer) return
+    var watchPrev = widNum !== undefined ? queryWindowBounds(widNum) : null
+    dragWatchTimer = $.NSTimer.scheduledTimerWithTimeIntervalRepeatsBlock(1 / 60, true, function(t) {
+      if (!$.CGEventSourceButtonState(0, 0)) {
+        dragWatchTimer.invalidate
+        dragWatchTimer = null
+        runSettleChain()
+        return
+      }
+      // While the button is held on this window, watch its bounds at 60Hz — double the pulse
+      // rate — so motion the press classification missed still hides within ~a frame
+      // (seventeenth addendum: the remaining fast-drag flashes were classification misses
+      // falling back to the pulse's ~2-frame catch).
+      if (widNum === undefined) return
+      var cur = queryWindowBounds(widNum)
+      if (!cur) return
+      if (watchPrev && (cur.x !== watchPrev.x || cur.y !== watchPrev.y ||
+                        cur.width !== watchPrev.width || cur.height !== watchPrev.height)) {
+        lastMotionTimeById[widNum] = Date.now()
+        for (var sid in overlays) {
+          if (sessionCache[sid] && sessionCache[sid].windowID === widNum && overlays[sid].hidden !== true) {
+            setOverlayVisible(overlays[sid], null, false)
+          }
+        }
+      }
+      watchPrev = cur
+    })
+  }
+
+  function onLeftUp() {
+    runSettleChain()   // plain-click path (this event does arrive when no drag loop consumed it)
+  }
+
+  // Slow tick: Apple Events. Only job is discovering tty->windowID for sessions not yet cached.
+  // Fine if this occasionally stalls during a drag — it's not on the responsiveness-critical path.
+  function slowTick() {
+    var files = listJSONFiles()
+    var needsDiscovery = false
+    for (var i = 0; i < files.length; i++) {
+      if (!sessionCache[files[i].slice(0, -5)]) { needsDiscovery = true; break }
+    }
+    if (!needsDiscovery) return
+
+    var ttyMap = getTtyWindowMap()
+    var cgWindows = getTerminalCGWindows()
+
+    for (var i = 0; i < files.length; i++) {
+      var fname = files[i]
+      var sessionId = fname.slice(0, -5)
+      if (sessionCache[sessionId]) continue
+
+      var data = readJSON(statusDir + fname)
+      if (!data) continue
+      var tty = data.tty
+      var winBounds = tty ? ttyMap[tty] : null
+      if (!winBounds) continue
+      var wid = findWindowID(cgWindows, winBounds)
+      if (wid === null) continue
+      sessionCache[sessionId] = { windowID: wid }
+    }
+  }
+
+  var fm2 = $.NSFileManager.defaultManager
+  fm2.createDirectoryAtPathWithIntermediateDirectoriesAttributesError(statusDir, true, $(), $())
+
+  slowTick()
+  fastTick()
+  var tickTimer = $.NSTimer.scheduledTimerWithTimeIntervalRepeatsBlock(TICK_INTERVAL, true, function(t) {
+    fastTick()
+  })
+  var pulseTimer = $.NSTimer.scheduledTimerWithTimeIntervalRepeatsBlock(PULSE_INTERVAL, true, function(t) {
+    pulseTick()
+  })
+  var slowTimer = $.NSTimer.scheduledTimerWithTimeIntervalRepeatsBlock(1.5, true, function(t) {
+    slowTick()
+  })
+  // Keep the returned monitor object referenced for the process lifetime — if it were
+  // garbage-collected, AppKit would tear the monitor down and drag sensing would silently
+  // degrade to the pulse/tick paths. Masks: LeftMouseDown = 1<<1, LeftMouseUp = 1<<2;
+  // event types in the handler: LeftMouseDown=1, LeftMouseUp=2.
+  var dragMonitor = $.NSEvent.addGlobalMonitorForEventsMatchingMaskHandler(2 | 4, function(evt) {
+    if (String(evt.type) === "1") onLeftDown(evt)
+    else onLeftUp()
+  })
+
+  app.run
+}

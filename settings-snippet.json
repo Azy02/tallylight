@@ -1,0 +1,65 @@
+{
+  "_comment": "Merge this 'hooks' block into your own ~/.claude/settings.json — do not replace the whole file with this, it almost certainly has other settings in it already. If you already have a 'hooks' key, merge these event entries into it individually rather than overwriting.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/status-indicator.sh working" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/status-indicator.sh idle" }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/status-indicator.sh needs-input" }
+        ]
+      },
+      {
+        "matcher": "agent_needs_input",
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/status-indicator.sh needs-input" }
+        ]
+      },
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/status-indicator.sh idle" }
+        ]
+      },
+      {
+        "matcher": "elicitation_dialog",
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/status-indicator.sh needs-input" }
+        ]
+      },
+      {
+        "matcher": "agent_completed",
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/status-indicator.sh observe" }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/status-indicator.sh error" }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          { "type": "command", "command": "~/.claude/hooks/status-cleanup.sh" }
+        ]
+      }
+    ]
+  }
+}
