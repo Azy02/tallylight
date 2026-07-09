@@ -22,9 +22,10 @@ function run(argv) {
   ObjC.bindFunction('CFArrayGetCount', ['long', ['void *']])
   ObjC.bindFunction('CFArrayGetValueAtIndex', ['void *', ['void *', 'long']])
   ObjC.bindFunction('CFRelease', ['void', ['void *']])
-  ObjC.bindFunction('kill', ['int', ['int', 'int']])   // kill(pid, 0): 0 = alive, -1 = gone —
-                                                        // powers the gray "stale" badge for
-                                                        // sessions whose claude process died
+  // NOTE: do NOT bindFunction('kill') for pid liveness — empirically (2026-07-09, isolated in
+  // recolor-crash-probe.jxa), one call through a bound kill() corrupts pointer state and the
+  // next CALayer backgroundColor assignment dies with EXC_ARM_PAC_FAIL. Liveness is done with
+  // a batched /bin/ps via NSTask in slowTick instead (pure ObjC, bridge-safe).
 
   var statusDir = $.NSHomeDirectory().js + "/.claude/status/"
   var overlays = {}          // session_id -> { window, layer, status }
@@ -120,9 +121,20 @@ function run(argv) {
     "stale":       [0.58, 0.58, 0.58]
   }
 
-  function colorFor(status) {
-    var c = COLORS[status] || [0.6, 0.6, 0.6]
-    return $.NSColor.colorWithSRGBRedGreenBlueAlpha(c[0], c[1], c[2], 1.0)
+  // CGColors are created ONCE here and cached for the process lifetime, deliberately never
+  // released (six tiny objects). The previous pattern — assigning a fresh autoreleased
+  // NSColor's .CGColor to layer.backgroundColor on every recolor — raced the color's own
+  // lifetime under allocation churn and died in CFRetain with EXC_ARM_PAC_FAIL. That race was
+  // ALSO this project's long-standing "rare crash every few hours" (same stack); it became
+  // deterministic on 2026-07-09 and was isolated in recolor-crash-probe.jxa: ~250 fresh-color
+  // recolors crash, 2000 cached-ref recolors survive. Do not go back to per-call colors.
+  var COLOR_REFS = {}
+  for (var ck in COLORS) {
+    COLOR_REFS[ck] = $.CGColorCreateGenericRGB(COLORS[ck][0], COLORS[ck][1], COLORS[ck][2], 1.0)
+  }
+  var COLOR_REF_FALLBACK = $.CGColorCreateGenericRGB(0.6, 0.6, 0.6, 1.0)
+  function colorRefFor(status) {
+    return COLOR_REFS[status] || COLOR_REF_FALLBACK
   }
 
   function listJSONFiles() {
@@ -318,7 +330,7 @@ function run(argv) {
     return null
   }
 
-  function makeOverlayWindow(color) {
+  function makeOverlayWindow(colorRef) {
     var rect = $.NSMakeRect(0, 0, RECT_WIDTH, RECT_HEIGHT)
     var win = $.NSWindow.alloc.initWithContentRectStyleMaskBackingDefer(rect, 0, $.NSBackingStoreBuffered, false)
     win.setOpaque(false)
@@ -343,7 +355,7 @@ function run(argv) {
     var view = $.NSView.alloc.initWithFrame(rect)
     view.setWantsLayer(true)
     var layer = view.layer
-    layer.backgroundColor = color.CGColor
+    layer.backgroundColor = colorRef
     layer.cornerRadius = RECT_RADIUS
     win.contentView = view
 
@@ -442,10 +454,10 @@ function run(argv) {
       // status — "did this window silently die?" is a different question from "is it quiet?",
       // and timestamp heuristics can't answer it (a single working turn can legitimately run
       // an hour with no file update). pid is recorded by the hook since 2026-07-09; files
-      // without one just skip the check.
-      if (data.pid && data.pid > 0 && $.kill(data.pid, 0) !== 0) status = "stale"
+      // without one, and ticks before the first liveness sweep, skip the check.
+      if (data.pid && data.pid > 0 && alivePids !== null && alivePids[data.pid] !== true) status = "stale"
       if (!rec) {
-        rec = overlays[sessionId] = makeOverlayWindow(colorFor(status))
+        rec = overlays[sessionId] = makeOverlayWindow(colorRefFor(status))
         rec.status = status
         rec.hidden = null   // unset, so the first visibility call below always actually applies
         rec.occluded = occluded
@@ -456,7 +468,7 @@ function run(argv) {
           setOverlayVisible(rec, cached.windowID, false)
         }
       } else if (rec.status !== status) {
-        rec.layer.backgroundColor = colorFor(status).CGColor
+        rec.layer.backgroundColor = colorRefFor(status)
         rec.status = status
       }
     }
@@ -746,9 +758,36 @@ function run(argv) {
     runSettleChain()   // plain-click path (this event does arrive when no drag loop consumed it)
   }
 
+  // Pid-liveness sweep: one /bin/ps spawn per slow tick, full pid list (no -p filtering — a
+  // single out-of-range or dead pid makes ps reject an entire -p list). ~5ms every 1.5s; the
+  // tick consults the resulting map, so a dead session grays within ~2s.
+  var alivePids = null
+  function refreshPidLiveness() {
+    try {
+      var task = $.NSTask.alloc.init
+      task.launchPath = "/bin/ps"
+      task.arguments = ["-axo", "pid="]
+      var pipe = $.NSPipe.pipe
+      task.standardOutput = pipe
+      task.standardError = $.NSFileHandle.fileHandleWithNullDevice
+      task.launch
+      task.waitUntilExit
+      var out = $.NSString.alloc.initWithDataEncoding(
+        pipe.fileHandleForReading.readDataToEndOfFile, $.NSUTF8StringEncoding).js || ""
+      var m = {}
+      var lines = out.split("\n")
+      for (var i = 0; i < lines.length; i++) {
+        var pnum = parseInt(lines[i], 10)
+        if (pnum) m[pnum] = true
+      }
+      alivePids = m
+    } catch (e) {}
+  }
+
   // Slow tick: Apple Events. Only job is discovering tty->windowID for sessions not yet cached.
   // Fine if this occasionally stalls during a drag — it's not on the responsiveness-critical path.
   function slowTick() {
+    refreshPidLiveness()
     var files = listJSONFiles()
     var needsDiscovery = false
     for (var i = 0; i < files.length; i++) {
