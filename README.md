@@ -6,8 +6,6 @@ When you run several [Claude Code](https://claude.com/claude-code) sessions side
 tallylight shows which Terminal window is working, idle, waiting for your input, failed, or
 dead — without clicking through every window.
 
-![demo](docs/demo.gif)
-
 | Light | Status |
 |---|---|
 | ![working](docs/badge-working.png) | **working** — Claude is doing something |
